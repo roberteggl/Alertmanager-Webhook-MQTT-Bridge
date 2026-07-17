@@ -18,7 +18,7 @@
           version = "0.1.0";
           src = ./.;
           subPackages = [ "." ];
-          vendorHash = "sha256-MI4E/GD3ExJgOKLzgK8+8YuCAxwZHI/GVOsL1rhsG9c=";
+          vendorHash = "sha256-CYNAQ2CoMCB9ha1DSSgjRv4vJqqBOHImm8k8tvwAsTc=";
         };
 
         # The actual binary name (Go uses directory/module name)
