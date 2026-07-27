@@ -1,143 +1,106 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"sort"
+	"os/signal"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-type webhookPayload struct {
-	Alerts []alert `json:"alerts"`
-}
-
-type alert struct {
-	Status      string            `json:"status"`
-	Labels      map[string]string `json:"labels"`
-	Fingerprint string            `json:"fingerprint"`
-}
-
-type mqttMessage struct {
-	State        string `json:"state"`
-	ActiveAlerts int    `json:"active_alerts"`
-	Source       string `json:"source"`
-}
-
-var severityRank = map[string]int{
-	"ok":       0,
-	"info":     1,
-	"warning":  2,
-	"error":    3,
-	"critical": 4,
-}
-
-// activeAlerts tracks all currently firing alerts by fingerprint
-type activeAlert struct {
-	Fingerprint string
-	Severity    string
-}
-
-var (
-	activeAlertsMap = make(map[string]activeAlert)
-	alertsMutex     sync.RWMutex
-)
+const maxRequestBody = 1 << 20
 
 func main() {
 	listenAddr := getEnv("HTTP_LISTEN_ADDR", ":8080")
 	broker := getEnv("MQTT_BROKER", "tcp://mosquitto:1883")
 	topic := getEnv("MQTT_TOPIC", "homelab/health")
 	clientID := getEnv("MQTT_CLIENT_ID", "alertmanager-mqtt-bridge")
-	mqttUser := strings.TrimSpace(os.Getenv("MQTT_USERNAME"))
-	mqttPass := strings.TrimSpace(os.Getenv("MQTT_PASSWORD"))
-
-	log.Printf("starting alertmanager-webhook-mqtt-bridge")
-	log.Printf("configuration: broker=%s, topic=%s, client_id=%s, listen_addr=%s", broker, topic, clientID, listenAddr)
-	if mqttUser != "" {
-		log.Printf("mqtt authentication enabled for user: %s", mqttUser)
+	client := connectMQTT(broker, clientID, strings.TrimSpace(os.Getenv("MQTT_USERNAME")), strings.TrimSpace(os.Getenv("MQTT_PASSWORD")))
+	app := &service{store: newAlertStore(), policy: filterPolicy{AllowedSeverities: severitySet(os.Getenv("ALLOWED_SEVERITIES")), ExcludedIdentity: labelSet(os.Getenv("IDENTITY_EXCLUDED_LABELS"))}, publisher: mqttPublisher{client: client, topic: topic}}
+	server := &http.Server{Addr: listenAddr, Handler: routes(app, client, broker, topic), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+	go func() {
+		log.Printf("http server listening on %s", listenAddr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("http server stopped: %v", err)
+		}
+	}()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
 	}
+	client.Disconnect(250)
+}
 
-	client := connectMQTT(broker, clientID, mqttUser, mqttPass)
-	log.Printf("mqtt client connected successfully to %s", broker)
+type mqttHealth interface{ IsConnected() bool }
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		
-		connected := client.IsConnected()
-		status := "healthy"
-		statusCode := http.StatusOK
-		
-		if !connected {
-			status = "unhealthy"
-			statusCode = http.StatusServiceUnavailable
-			log.Printf("health check: mqtt client not connected")
+func routes(app *service, client mqttHealth, broker, topic string) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
 		}
-		
-		response := map[string]interface{}{
-			"status":        status,
-			"mqtt_connected": connected,
-			"broker":        broker,
-			"topic":         topic,
+		code := http.StatusOK
+		state := "healthy"
+		if !client.IsConnected() {
+			code = http.StatusServiceUnavailable
+			state = "unhealthy"
 		}
-		
-		w.WriteHeader(statusCode)
-		json.NewEncoder(w).Encode(response)
+		writeJSON(w, code, map[string]any{"status": state, "mqtt_connected": client.IsConnected(), "broker": broker, "topic": topic})
 	})
-
-	http.HandleFunc("/alert", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("received alert webhook from %s", r.RemoteAddr)
-		
+	mux.HandleFunc("/alert", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			log.Printf("method not allowed: %s (expected POST)", r.Method)
 			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
-			log.Printf("unsupported content type: %s", ct)
-			http.Error(w, "unsupported content type", http.StatusUnsupportedMediaType)
+		if contentType := r.Header.Get("Content-Type"); contentType != "" && !strings.HasPrefix(contentType, "application/json") {
+			jsonError(w, "unsupported content type", http.StatusUnsupportedMediaType)
 			return
 		}
-
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		defer r.Body.Close()
 		var payload webhookPayload
 		decoder := json.NewDecoder(r.Body)
 		if err := decoder.Decode(&payload); err != nil {
-			log.Printf("failed to decode json payload: %v", err)
-			http.Error(w, "invalid json payload", http.StatusBadRequest)
+			jsonError(w, "invalid json payload", http.StatusBadRequest)
 			return
 		}
-
-		log.Printf("processing webhook: %d alerts received", len(payload.Alerts))
-		
-		// Update active alerts map based on this webhook
-		updateActiveAlerts(payload.Alerts)
-		
-		// Calculate state from all active alerts across all groups
-		state, active := calculateOverallState()
-		log.Printf("calculated overall state: %s (%d active alerts across all groups)", state, active)
-		
-		if err := publishState(client, topic, state, active); err != nil {
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			jsonError(w, "invalid json payload", http.StatusBadRequest)
+			return
+		}
+		result, err := app.process(payload.Alerts)
+		if err != nil {
 			log.Printf("mqtt publish failed: %v", err)
-			http.Error(w, "failed to publish", http.StatusBadGateway)
+			jsonError(w, "failed to publish", http.StatusBadGateway)
 			return
 		}
-
-		log.Printf("successfully published state %s to topic %s", state, topic)
-		w.WriteHeader(http.StatusOK)
+		writeJSON(w, http.StatusOK, result)
 	})
-
-	log.Printf("http server listening on %s", listenAddr)
-	log.Printf("endpoints: POST /alert, GET /health")
-	if err := http.ListenAndServe(listenAddr, nil); err != nil {
-		log.Fatalf("http server stopped: %v", err)
-	}
+	return mux
 }
 
+func writeJSON(w http.ResponseWriter, code int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(value)
+}
+func jsonError(w http.ResponseWriter, message string, code int) {
+	writeJSON(w, code, map[string]string{"error": message})
+}
 func getEnv(key, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
@@ -145,138 +108,30 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func connectMQTT(broker, clientID, username, password string) mqtt.Client {
-	log.Printf("connecting to mqtt broker: %s (client_id: %s)", broker, clientID)
-	
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(broker)
-	opts.SetClientID(clientID)
-	opts.SetAutoReconnect(true)
-	opts.SetConnectRetry(true)
-	opts.SetConnectRetryInterval(2 * time.Second)
-	
-	// Add connection event handlers for logging
-	opts.SetOnConnectHandler(func(c mqtt.Client) {
-		log.Printf("mqtt client connected (reconnect)")
-	})
-	opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
-		log.Printf("mqtt connection lost: %v", err)
-	})
-	
-	if username != "" {
-		opts.SetUsername(username)
-		opts.SetPassword(password)
-		log.Printf("mqtt authentication configured")
-	}
-
-	client := mqtt.NewClient(opts)
-	log.Printf("attempting mqtt connection...")
-	token := client.Connect()
-	if token.Wait() && token.Error() != nil {
-		log.Fatalf("mqtt connect failed: %v", token.Error())
-	}
-	log.Printf("mqtt connection established successfully")
-	return client
+type mqttPublisher struct {
+	client mqtt.Client
+	topic  string
 }
 
-// updateActiveAlerts processes a webhook payload and updates the global active alerts map
-func updateActiveAlerts(alerts []alert) {
-	alertsMutex.Lock()
-	defer alertsMutex.Unlock()
-
-	for _, a := range alerts {
-		fingerprint := a.Fingerprint
-		if fingerprint == "" {
-			// Fallback: generate a simple fingerprint from labels if not provided
-			// This shouldn't happen with Alertmanager v2+, but handle it gracefully
-			log.Printf("warning: alert missing fingerprint, generating from labels")
-			fingerprint = generateFingerprint(a.Labels)
-		}
-
-		if a.Status == "firing" {
-			// Extract severity from labels
-			severity := "info"
-			if a.Labels != nil {
-				if s := strings.ToLower(strings.TrimSpace(a.Labels["severity"])); s != "" {
-					severity = s
-				}
-			}
-			activeAlertsMap[fingerprint] = activeAlert{
-				Fingerprint: fingerprint,
-				Severity:    severity,
-			}
-			log.Printf("alert added/updated: fingerprint=%s, severity=%s", fingerprint, severity)
-		} else if a.Status == "resolved" {
-			delete(activeAlertsMap, fingerprint)
-			log.Printf("alert resolved: fingerprint=%s", fingerprint)
-		}
-	}
-}
-
-// generateFingerprint creates a simple fingerprint from labels (fallback)
-// This is deterministic by sorting keys
-func generateFingerprint(labels map[string]string) string {
-	if len(labels) == 0 {
-		return "unknown"
-	}
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var parts []string
-	for _, k := range keys {
-		parts = append(parts, k+"="+labels[k])
-	}
-	return strings.Join(parts, ",")
-}
-
-// calculateOverallState calculates the highest severity from all active alerts
-func calculateOverallState() (string, int) {
-	alertsMutex.RLock()
-	defer alertsMutex.RUnlock()
-
-	if len(activeAlertsMap) == 0 {
-		return "NONE", 0
-	}
-
-	highest := ""
-	highestRank := -1
-	activeCount := 0
-
-	for _, alert := range activeAlertsMap {
-		activeCount++
-		rank, ok := severityRank[alert.Severity]
-		if !ok {
-			rank = severityRank["info"]
-		}
-		if rank > highestRank {
-			highestRank = rank
-			highest = alert.Severity
-		}
-	}
-
-	return strings.ToUpper(highest), activeCount
-}
-
-func publishState(client mqtt.Client, topic, state string, active int) error {
-	message := mqttMessage{
-		State:        state,
-		ActiveAlerts: active,
-		Source:       "alertmanager",
-	}
+func (p mqttPublisher) Publish(message snapshot) error {
 	payload, err := json.Marshal(message)
 	if err != nil {
-		log.Printf("failed to marshal mqtt message: %v", err)
 		return err
 	}
-
-	log.Printf("publishing to topic %s: state=%s, active_alerts=%d", topic, state, active)
-	token := client.Publish(topic, 1, true, payload)
-	if token.Wait() && token.Error() != nil {
-		log.Printf("mqtt publish error: %v", token.Error())
-		return token.Error()
+	token := p.client.Publish(p.topic, 1, true, payload)
+	token.Wait()
+	return token.Error()
+}
+func connectMQTT(broker, clientID, username, password string) mqtt.Client {
+	opts := mqtt.NewClientOptions().AddBroker(broker).SetClientID(clientID).SetAutoReconnect(true).SetConnectRetry(true).SetConnectRetryInterval(2 * time.Second)
+	if username != "" {
+		opts.SetUsername(username).SetPassword(password)
 	}
-	log.Printf("mqtt message published successfully (qos=1, retained=true)")
-	return nil
+	client := mqtt.NewClient(opts)
+	token := client.Connect()
+	token.Wait()
+	if err := token.Error(); err != nil {
+		log.Fatalf("mqtt connect failed: %v", err)
+	}
+	return client
 }

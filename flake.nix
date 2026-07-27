@@ -12,6 +12,12 @@
       let
         pkgs = import nixpkgs { inherit system; };
         name = "alertmanager-mqtt-bridge";
+        imageSource =
+          let fromEnv = builtins.getEnv "IMAGE_SOURCE";
+          in if fromEnv != "" then fromEnv else "https://github.com/roberteggl/Alertmanager-Webhook-MQTT-Bridge";
+        imageRevision =
+          let fromEnv = builtins.getEnv "IMAGE_REVISION";
+          in if fromEnv != "" then fromEnv else (self.rev or self.dirtyRev or "unknown");
 
         goBuild = pkgs.buildGoModule {
           pname = name;
@@ -50,6 +56,10 @@
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
+            Labels = {
+              "org.opencontainers.image.source" = imageSource;
+              "org.opencontainers.image.revision" = imageRevision;
+            };
           };
         };
       in

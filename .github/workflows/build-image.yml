@@ -64,8 +64,11 @@ jobs:
           echo "${{ github.token }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build Docker image
+        env:
+          IMAGE_SOURCE: https://github.com/${{ github.repository }}
+          IMAGE_REVISION: ${{ github.sha }}
         run: |
-          nix build ".#packages.${{ matrix.system }}.dockerImage" --out-link result-${{ matrix.arch }}
+          nix build ".#packages.${{ matrix.system }}.dockerImage" --impure --out-link result-${{ matrix.arch }}
 
       - id: repository
         name: Generate Registry String
@@ -105,12 +108,19 @@ jobs:
         run: |
           IMAGE="${{ steps.repository.outputs.lowercase }}"
           
+          ANNOTATIONS=(
+            "--annotation" "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}"
+            "--annotation" "index:org.opencontainers.image.revision=${{ github.sha }}"
+          )
+
           # Create build-X multi-arch manifest
           docker buildx imagetools create -t "$IMAGE:build-${{ github.run_number }}" \
+            "${ANNOTATIONS[@]}" \
             "$IMAGE:amd64" \
             "$IMAGE:arm64"
           
           # Create latest multi-arch manifest
           docker buildx imagetools create -t "$IMAGE:latest" \
+            "${ANNOTATIONS[@]}" \
             "$IMAGE:amd64" \
             "$IMAGE:arm64"
