@@ -83,7 +83,7 @@ jobs:
 
   publish-manifest:
     name: Publish Multi-Arch Manifest
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [ build-and-deploy ]
     permissions:
       contents: read
