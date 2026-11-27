@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: nixbuild/nix-quick-install-action@v35
+      - uses: nixbuild/nix-quick-install-action@v36
 
       - name: Fix Nix Store Permissions
         run: |
@@ -83,7 +83,7 @@ jobs:
 
   publish-manifest:
     name: Publish Multi-Arch Manifest
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [ build-and-deploy ]
     permissions:
       contents: read
